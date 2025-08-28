@@ -216,7 +216,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
   --role="roles/storage.admin"
 ```
 
-## Step 7: Configure Health Checks
+### Configure Health Checks
 
 Create a health check endpoint by modifying your container to include a health check script:
 
@@ -235,7 +235,7 @@ Create `healthcheck.sh`:
 curl -f http://localhost:8080/health || exit 1
 ```
 
-## Step 8: Testing Your Deployment
+### Testing Your Deployment
 
 Once deployed, test your Dgraph instance:
 
@@ -247,7 +247,7 @@ SERVICE_URL=$(gcloud run services describe dgraph-cr --platform managed --region
 curl $SERVICE_URL/health
 ```
 
-## Step 10: Set Up Monitoring and Logging
+### Set Up Monitoring and Logging
 
 Enable Cloud Monitoring for your Cloud Run service:
 
