@@ -1,6 +1,6 @@
 # Deploying Dgraph on Google Cloud Run
 
-This guide walks you through deploying Dgraph, a distributed graph database, on Google Cloud Run. Cloud Run is ideal for Dgraph because it provides serverless scaling, built-in load balancing, and simplified container deployment.
+This guide walks you through deploying Dgraph, a distributed graph database, on Google Cloud Run.
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ Dgraph consists of three main components:
 - **Zero nodes**: Manage cluster metadata and coordinate transactions
 - **Ratel**: Web UI for database administration (optional)
 
-For Cloud Run deployment, we'll focus on Alpha nodes since Zero nodes are primarily needed for multi-node clusters.
+This example uses the Dgraph standalone Docker image which includes both the alpha and zero nodes in a single container.
 
 ## Step 1: Project Setup
 
@@ -30,6 +30,30 @@ gcloud config set project $PROJECT_ID
 gcloud services enable run.googleapis.com
 gcloud services enable containerregistry.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
+gcloud services enable file.googleapis.com
+gcloud services enable vpcaccess.googleapis.com
+```
+
+Create a Filestore instance for persistent data:
+
+```bash
+gcloud filestore instances create dgraph-data \
+  --zone=us-central1-a \
+  --tier=BASIC_HDD \
+  --file-share=name=dgraph,capacity=1GB \
+  --network=name=default
+```
+
+Create VPC connector for private network access (this is required for the Filestore volume)
+
+```bash
+# Create VPC connector for private network access
+gcloud compute networks vpc-access connectors create dgraph-connector \
+  --network default \
+  --region us-central1 \
+  --range 10.8.0.0/28 \
+  --min-instances 2 \
+  --max-instances 3
 ```
 
 ## Step 2: Create Dgraph Configuration
@@ -101,10 +125,10 @@ Create `start.sh`:
 #!/bin/bash
 
 # Start Dgraph Zero
-dgraph zero --config /dgraph/config/dgraph-config.yml &
+dgraph zero --tls use-system-ca=true --config /dgraph/config/dgraph-config.yml &
 
 # Start Dgraph Alpha
-dgraph alpha --config /dgraph/config/dgraph-config.yml &
+dgraph alpha --tls use-system-ca=true --config /dgraph/config/dgraph-config.yml &
 
 # Wait for all processes to finish
 wait
@@ -144,79 +168,41 @@ docker push gcr.io/$PROJECT_ID/dgraph-cr
 Deploy Dgraph Alpha to Cloud Run:
 
 ```bash
-gcloud run deploy dgraph-cr \
-  --image gcr.io/$PROJECT_ID/dgraph-cr \
+gcloud run deploy dgraph-cr \                                          
+  --image gcr.io/($PROJECT_ID)/dgraph-cr \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
-  --memory 2Gi \
+  --memory 4Gi \
   --cpu 2 \
-  --concurrency 100 \
-  --timeout 900 \
-  --port 8080
+  --vpc-connector dgraph-connector \
+  --add-volume name=dgraph-storage,type=nfs,location=$FILESTORE_IP:/dgraph \
+  --add-volume-mount volume=dgraph-storage,mount-path=/dgraph/data
 ```
 
 ![](img/cloud-run-deployed.png)
 
-## Step 5: Configure Persistent Storage
+Our Dgraph instance is now available at `https://dgraph-cr-<REVISION_ID>.us-central1.run.app`
 
-Since Cloud Run is stateless, you'll need persistent storage for your data. Use Google Cloud Storage or Cloud SQL:
+> Note that we are binding Dgraph's HTTP port 8080 to port 80
 
-### Option A: Cloud Storage (Recommended for backups)
+Verify deployment:
 
-Create a Cloud Storage bucket:
+```
+curl https://dgraph-cr-588562224274.us-central1.run.app/health
 
-```bash
-gsutil mb gs://$PROJECT_ID-dgraph-backups
+-----
+[{"instance":"alpha","address":"localhost:7080","status":"healthy","group":"1","version":"v24.1.4","uptime":1258,"lastEcho":1756412281,"ongoing":["opRollup"],"ee_features":["backup_restore","cdc"],"max_assigned":8}]%
 ```
 
-### Option B: Cloud Filestore (For persistent data)
 
-Create a Filestore instance:
+> Ratel web UI can be run locally using `docker run -it -p 8000:8000 dgraph/ratel:latest`
 
-```bash
-gcloud filestore instances create dgraph-data \
-  --zone=us-central1-a \
-  --tier=BASIC_HDD \
-  --file-share=name=dgraph,capacity=1TB \
-  --network=name=default
-```
+![](img/ratel-setup.png)
 
-Update your Dockerfile to mount the Filestore:
+![](img/ratel-web-ui.png)
 
-```dockerfile
-FROM dgraph/dgraph:latest
-
-# Mount point for Filestore
-VOLUME ["/dgraph/data"]
-
-EXPOSE 8080 9080
-
-CMD ["dgraph", "alpha", "--postings=/dgraph/data/p", "--wal=/dgraph/data/w", "--my=0.0.0.0:7080", "--zero=0.0.0.0:5080"]
-```
-
-## Step 6: Set Up Networking and Security
-
-### Configure VPC Connector (if using Filestore)
-
-```bash
-gcloud compute networks vpc-access connectors create dgraph-connector \
-  --network default \
-  --region us-central1 \
-  --range 10.8.0.0/28
-```
-
-Deploy with VPC connector:
-
-```bash
-gcloud run deploy dgraph-alpha \
-  --image gcr.io/$PROJECT_ID/dgraph-alpha \
-  --platform managed \
-  --region us-central1 \
-  --vpc-connector dgraph-connector \
-  --memory 2Gi \
-  --cpu 2
-```
+## Optional Configurations
 
 ### Set up IAM and Security
 
@@ -255,13 +241,10 @@ Once deployed, test your Dgraph instance:
 
 ```bash
 # Get the Cloud Run service URL
-SERVICE_URL=$(gcloud run services describe dgraph-alpha --platform managed --region us-central1 --format 'value(status.url)')
+SERVICE_URL=$(gcloud run services describe dgraph-cr --platform managed --region us-central1 --format 'value(status.url)')
 
 # Test the health endpoint
 curl $SERVICE_URL/health
-
-# Test a simple GraphQL query
-curl -X POST $SERVICE_URL/query -H "Content-Type: application/json" -d '{"query": "{ __schema { types { name } } }"}'
 ```
 
 ## Step 10: Set Up Monitoring and Logging
@@ -285,33 +268,6 @@ conditions:
       thresholdValue: 0.8
 ```
 
-## Production Considerations
-
-### Scaling and Performance
-
-1. **Memory allocation**: Start with at least 2GB for production workloads
-2. **CPU allocation**: Use at least 2 vCPU for better performance
-3. **Concurrency**: Adjust based on your query complexity and load
-4. **Timeout**: Set appropriate timeout values for long-running queries
-
-### Security Best Practices
-
-1. **Authentication**: Enable Dgraph's built-in authentication
-2. **Network security**: Use VPC connectors and private services
-3. **Data encryption**: Enable encryption at rest and in transit
-4. **Access control**: Implement proper IAM roles and service accounts
-
-### Backup Strategy
-
-Set up automated backups:
-
-```bash
-# Create a Cloud Function for automated backups
-gcloud functions deploy dgraph-backup \
-  --runtime nodejs14 \
-  --trigger-topic dgraph-backup-topic \
-  --entry-point backup
-```
 
 ### Multi-Region Deployment
 
@@ -320,7 +276,7 @@ For high availability, deploy across multiple regions:
 ```bash
 # Deploy to multiple regions
 for region in us-central1 us-east1 europe-west1; do
-  gcloud run deploy dgraph-alpha-$region \
+  gcloud run deploy dgraph-rc-$region \
     --image gcr.io/$PROJECT_ID/dgraph-alpha \
     --platform managed \
     --region $region \
