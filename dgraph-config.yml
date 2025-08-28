@@ -1,0 +1,25 @@
+# Dgraph configuration for standalone deployment
+
+datadir: /dgraph/data
+bindall: true
+
+# HTTP & GRPC ports
+port_offset: 0
+grpc_port: 9080
+http_port: 8080
+
+# Alpha configuration
+alpha:
+  lru_mb: 1024
+
+# Security settings (adjust as needed)
+whitelist: 0.0.0.0/0
+
+# Logging
+logtostderr: true
+v: 2
+
+# Performance tuning for cloud deployment
+badger:
+  compression: snappy
+  numgoroutines: 8
