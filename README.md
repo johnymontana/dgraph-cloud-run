@@ -202,7 +202,225 @@ curl https://dgraph-cr-588562224274.us-central1.run.app/health
 
 ![](img/ratel-web-ui.png)
 
+
+## Dgraph Cloud Migration Steps
+
+To migrate ...
+
+TODO: screen shots and button clicking steps
+
+
+### Migration data
+
+We've now downlaoded the following files from Dgraph Cloud:
+
+* `gql_schema.gz` - your GraphQL schema exported from Dgraph Cloud
+* `schema.gz` - your Dgraph schema export from Dgraph Cloud
+* `rdf.gz` - your RDF data export from Dgraph Cloud
+
+We'll now migrate this data to our Dgraph instance running in Cloud Run.
+
+### Prepare Migration Environment
+
+Create a local directory for migration files:
+
+```bash
+mkdir dgraph-migration
+cd dgraph-migration
+
+# Extract the compressed files
+gunzip gql_schema.gz
+gunzip schema.gz
+gunzip rdf.gz
+
+# Verify file contents
+head -20 gql_schema
+head -20 schema
+head -20 rdf
+```
+
+### Schema Migration
+
+Option A: Load Schema Via Live Loader
+
+```bash
+dgraph live --schema schema \
+  --alpha https://api.yourdomain.com:443 \
+  --zero http://api.yourdomain.com:443 
+```
+
+
+Option B: Load Schema Via HTTP API
+
+```bash
+curl -X POST https://api.yourdomain.com/admin/schema \
+  -H "Content-Type: application/rdf" \
+  --data-binary @schema
+```
+
+Option C: Load GraphQL Schema (if using GraphQL)
+
+```bash
+curl -X POST https://api.yourdomain.com/admin/schema/graphql \
+  -H "Content-Type: text/plain" \
+  --data-binary @gql_schema
+```
+
+### Data Migration
+
+
+#### Option A: Data Migration Using Live Loader
+
+For large datasets, use the live loader for optimal performance:
+
+```bash
+dgraph live --files rdf \
+  --alpha https://api.yourdomain.com:443 \
+  --zero https://api.yourdomain.com:443 \
+  --batch 1000 \
+  --conc 10
+```
+
+#### Option B: Data Migration Using Bulk Loader (Offline)
+
+For very large datasets, consider using the Dgraph bulk loader. This requires temporarily scaling down your Cloud Run instance:
+
+**Create Bulk Loader Container**
+
+Create `bulk-loder.Dockerfile`:
+
+```dockerfile
+FROM dgraph/dgraph:latest
+
+# Copy TLS certs and data
+COPY tls/ /dgraph/tls
+COPY rdf /data/rdf
+COPY schema /data/schema
+
+# Create output directory
+RUN mkdir -p /data/out
+
+WORKDIR /data
+
+# Run bulk loader
+CMD ["dgraph", "bulk", \
+  "--files", "/data/rdf", \
+  "--schema", "/data/schema", \
+  "--out", "/data/out", \
+  "--zero", "localhost:5080"]
+```
+
+
+**Run Bulk Load Process**
+
+```bash
+ Build bulk loader image
+docker build -f bulk-loader.Dockerfile -t gcr.io/$PROJECT_ID/dgraph-bulk-loader .
+docker push gcr.io/$PROJECT_ID/dgraph-bulk-loader
+
+# Scale down current Dgraph instance
+gcloud run services update dgraph-alpha --min-instances=0 --max-instances=0 --region us-central1
+
+# Run bulk loader as a job (this will process data offline)
+gcloud run jobs create dgraph-bulk-load \
+  --image gcr.io/$PROJECT_ID/dgraph-bulk-loader \
+  --region us-central1 \
+  --memory 8Gi \
+  --cpu 4 \
+  --max-retries 1 \
+  --parallelism 1 \
+  --task-timeout 7200
+
+# Execute the bulk load job
+gcloud run jobs execute dgraph-bulk-load --region us-central1
+```
+
+**Copy Bulk Load Results To Filestore**
+
+```bash
+# Create a temporary VM to copy data
+gcloud compute instances create dgraph-migration-vm \
+  --zone us-central1-a \
+  --machine-type n1-standard-2 \
+  --image-family debian-11 \
+  --image-project debian-cloud
+
+# SSH into the VM and mount Filestore
+gcloud compute ssh dgraph-migration-vm --zone us-central1-a
+
+# On the VM:
+sudo apt update && sudo apt install nfs-common -y
+sudo mkdir -p /mnt/dgraph
+sudo mount -t nfs $FILESTORE_IP:/dgraph /mnt/dgraph
+
+# Copy bulk load output to Filestore
+# (You'll need to copy the output from the bulk loader job)
+sudo cp -r /path/to/bulk/output/* /mnt/dgraph/
+
+# Restart Dgraph service
+gcloud run services update dgraph-alpha --min-instances=1 --max-instances=3 --region us-central1
+```
+
+### Validation and Testing
+
+#### Schema Validation
+
+```bash
+curl -X POST https://api.yourdomain.com/query
+-H "Content-Type: application/json" \
+-d '{"query": "schema {}"}'
+```
+
+#### Data Validation
+
+
+```bash
+# Check data counts
+curl -X POST https://api.yourdomain.com/query \
+  --cert tls/client.clientuser.crt \
+  --key tls/client.clientuser.key \
+  --cacert tls/ca.crt \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ nodeCount(func: has(dgraph.type)) }"}'
+
+# Validate specific data samples
+curl -X POST https://api.yourdomain.com/query \
+  --cert tls/client.clientuser.crt \
+  --key tls/client.clientuser.key \
+  --cacert tls/ca.crt \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ sample(func: has(dgraph.type), first: 10) { uid expand(_all_) } }"}'
+```
+
+### Migration Cleanup
+
+```bash
+# Clean up migration files
+rm -rf dgraph-migration/
+
+# Remove temporary bulk loader resources
+gcloud run jobs delete dgraph-bulk-load --region us-central1
+
+# Delete migration VM (if used)
+gcloud compute instances delete dgraph-migration-vm --zone us-central1-a
+
+# Update DNS to point to new instance (if needed)
+# Update your application configuration to use new endpoint\
+```
+
+
 ## Optional Configurations
+
+### Optimize Cloud Run Configuration
+
+```bash
+# Adjust resource allocation based on migrated data size
+gcloud run services update dgraph-alpha \
+  --memory 8Gi \
+  --cpu 4 \
+  --max-instances 5 \
+  --region us-central1
+```
 
 ### Set up IAM and Security
 
